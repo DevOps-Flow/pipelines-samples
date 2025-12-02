@@ -1,0 +1,224 @@
+name: Release Native • Build, Image, Push & ArgoCD Sync
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write # <— necessário para git push com GITHUB_TOKEN
+  # pull-requests: write  # (opcional, se for usar PR em vez de push direto)
+
+concurrency:
+  group: release-native-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOCKER_IMAGE: ${{ vars.DOCKER_IMAGE }}
+
+jobs:
+  release:
+    name: Build once (native) • Docker • Push • Update manifest • ArgoCD
+    runs-on: arc-runner-set
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Java 21 + Maven cache
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: maven
+
+      - name: Setup Maven 3.9.9
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.9.9
+
+      - name: Extract project version from pom.xml
+        id: ver
+        run: |
+          VERSION=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Project version: $VERSION"
+
+      - name: Decide image name
+        id: img
+        run: |
+          if [ -z "${{ env.DOCKER_IMAGE }}" ] || [ "${{ env.DOCKER_IMAGE }}" = "null" ]; then
+            REPO_NAME=$(basename "$GITHUB_REPOSITORY")
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${REPO_NAME}"
+          else
+            IMAGE="${{ env.DOCKER_IMAGE }}"
+          fi
+          echo "IMAGE=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Imagem alvo: $IMAGE"
+
+      - name: Update deployment image reference (early, tag legível)
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        env:
+          IMAGE:   ${{ steps.img.outputs.IMAGE }}
+          VERSION: ${{ steps.ver.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${IMAGE}" ] || [ -z "${VERSION}" ]; then
+            echo "ERRO: IMAGE ou VERSION vazias."
+            exit 1
+          fi
+
+          IMG="${IMAGE}:${VERSION}"
+          export IMG
+          echo "Atualizando imagem em k8s/20-deployment-service.yaml -> ${IMG}"
+
+          # yq local
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/yq" \
+            https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
+          chmod +x "$HOME/.local/bin/yq"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          # Atualiza a imagem (Deployment/Container: customer-api)
+          "$HOME/.local/bin/yq" -i '
+            (. | select(.kind=="Deployment" and .metadata.name=="customer-api")
+              .spec.template.spec.containers[]
+              | select(.name=="customer-api")).image = env(IMG)
+          ' k8s/20-deployment-service.yaml
+
+          # Sanity check: garante que a imagem não ficou vazia
+          NEW_IMAGE=$("$HOME/.local/bin/yq" '
+            (. | select(.kind=="Deployment" and .metadata.name=="customer-api")
+              .spec.template.spec.containers[]
+              | select(.name=="customer-api")).image
+          ' k8s/20-deployment-service.yaml)
+
+          if [ -z "${NEW_IMAGE}" ]; then
+            echo "ERRO: imagem ficou vazia após o yq. Abortando."
+            exit 1
+          fi
+          echo "Imagem final no manifesto: ${NEW_IMAGE}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/20-deployment-service.yaml
+          git commit -m "deploy: update image -> ${IMAGE}:${VERSION} [skip ci]" || echo "Sem alterações para commitar."
+          git fetch origin master
+          git pull --rebase origin master
+          git push
+
+
+      # ===== BUILD NATIVO (UMA ÚNICA VEZ) =====
+      - name: Build Quarkus Native (container-build)
+        run: mvn -B -ntp package -Pnative -Dquarkus.native.container-build=true
+
+      # ===== DOCKER: LOGIN, BUILD & PUSH =====
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push image (version + latest)
+        id: dkr
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.native
+          push: true
+          tags: |
+            ${{ steps.img.outputs.IMAGE }}:${{ steps.ver.outputs.VERSION }}
+            ${{ steps.img.outputs.IMAGE }}:latest
+          build-args: |
+            APP_VERSION=${{ steps.ver.outputs.VERSION }}
+
+      # 1) Tenta sincronizar (se falhar, o job continua e o próximo step faz rollback)
+      - name: Argo CD sync (pode falhar)
+        id: argocd-sync
+        continue-on-error: true
+        env:
+          VER: v2.12.3
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_TOKEN:  ${{ secrets.ARGOCD_TOKEN }}
+          ARGOCD_APP:    ${{ secrets.ARGOCD_APP }}
+        run: |
+          set -eo pipefail
+          docker pull quay.io/argoproj/argocd:${VER}
+
+          # refresh
+          docker run --rm \
+            -e ARGOCD_SERVER="$ARGOCD_SERVER" -e ARGOCD_TOKEN="$ARGOCD_TOKEN" -e ARGOCD_APP="$ARGOCD_APP" \
+            quay.io/argoproj/argocd:${VER} \
+            sh -lc 'argocd --grpc-web --insecure --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_TOKEN" app get "$ARGOCD_APP" --refresh'
+
+          # sync (este é o que normalmente falha quando algo deu errado no deploy)
+          docker run --rm \
+            -e ARGOCD_SERVER="$ARGOCD_SERVER" -e ARGOCD_TOKEN="$ARGOCD_TOKEN" -e ARGOCD_APP="$ARGOCD_APP" \
+            quay.io/argoproj/argocd:${VER} \
+            sh -lc 'argocd --grpc-web --insecure --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_TOKEN" app sync "$ARGOCD_APP" --prune --timeout 600'
+
+          # wait
+          docker run --rm \
+            -e ARGOCD_SERVER="$ARGOCD_SERVER" -e ARGOCD_TOKEN="$ARGOCD_TOKEN" -e ARGOCD_APP="$ARGOCD_APP" \
+            quay.io/argoproj/argocd:${VER} \
+            sh -lc 'argocd --grpc-web --insecure --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_TOKEN" app wait "$ARGOCD_APP" --health --timeout 600'
+
+      # 2) Rollback automático se o passo anterior falhar
+      - name: Rollback on failure (git revert + Argo CD sync)
+        if: steps.argocd-sync.outcome == 'failure'
+        env:
+          VER: v2.12.3
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_TOKEN:  ${{ secrets.ARGOCD_TOKEN }}
+          ARGOCD_APP:    ${{ secrets.ARGOCD_APP }}
+        run: |
+          set -euo pipefail
+
+          echo "⚠️ Deploy falhou — iniciando rollback GitOps…"
+
+          # Garante histórico atualizado
+          git fetch origin master
+          git checkout master
+          git pull --rebase origin master
+
+          # Encontra o último commit de bump de imagem e reverte
+          LAST_BUMP=$(git log --grep='^deploy: update image -> ' -n 1 --pretty=format:%H || true)
+          if [ -z "${LAST_BUMP}" ]; then
+            echo "ERRO: não encontrei commit de bump (deploy: update image -> ...). Abortando rollback."
+            exit 1
+          fi
+
+          echo "Revertendo commit ${LAST_BUMP}…"
+          git revert --no-edit "${LAST_BUMP}"
+          git push
+
+          # Sincroniza o ArgoCD para aplicar o rollback
+          docker pull quay.io/argoproj/argocd:${VER}
+
+          docker run --rm \
+            -e ARGOCD_SERVER="$ARGOCD_SERVER" -e ARGOCD_TOKEN="$ARGOCD_TOKEN" -e ARGOCD_APP="$ARGOCD_APP" \
+            quay.io/argoproj/argocd:${VER} \
+            sh -lc 'argocd --grpc-web --insecure --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_TOKEN" app get "$ARGOCD_APP" --refresh'
+
+          docker run --rm \
+            -e ARGOCD_SERVER="$ARGOCD_SERVER" -e ARGOCD_TOKEN="$ARGOCD_TOKEN" -e ARGOCD_APP="$ARGOCD_APP" \
+            quay.io/argoproj/argocd:${VER} \
+            sh -lc 'argocd --grpc-web --insecure --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_TOKEN" app sync "$ARGOCD_APP" --timeout 600'
+
+          docker run --rm \
+            -e ARGOCD_SERVER="$ARGOCD_SERVER" -e ARGOCD_TOKEN="$ARGOCD_TOKEN" -e ARGOCD_APP="$ARGOCD_APP" \
+            quay.io/argoproj/argocd:${VER} \
+            sh -lc 'argocd --grpc-web --insecure --server "$ARGOCD_SERVER" --auth-token "$ARGOCD_TOKEN" app wait "$ARGOCD_APP" --health --timeout 600'
+
+          echo "✅ Rollback concluído com sucesso."
